@@ -1,0 +1,141 @@
+# Copied from ODK Central meta-repo: nginx.vg-base.dockerfile
+# This Dockerfile builds host-exported artifacts used by the base image.
+
+# VG nginx base with optional dynamic modules.
+#
+# Notes:
+# - This intentionally does NOT pin SHAs/digests. We prefer simplicity over determinism here.
+# - NGINX_VERSION should match the nginx version in the chosen base image for module ABI compatibility.
+ARG BASE_IMAGE=jonasal/nginx-certbot:6.0.1
+
+ARG NGINX_VERSION=1.29.3
+
+# Build example:
+#   docker build -f nginx.vg-base.dockerfile --target vg-base -t vg-nginx:base .
+
+
+FROM ${BASE_IMAGE} AS module-builder
+
+ARG NGINX_VERSION
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        libpcre2-dev \
+        libssl-dev \
+        libxml2-dev \
+        pkg-config \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/nginx.tgz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+    && tar -xzf /tmp/nginx.tgz -C /tmp
+
+
+FROM module-builder AS build-modsecurity
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        automake \
+        autoconf \
+        libcurl4-openssl-dev \
+        libgeoip-dev \
+        liblmdb-dev \
+        libpcre2-dev \
+        libtool \
+        libyajl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --recurse-submodules https://github.com/owasp-modsecurity/ModSecurity /tmp/ModSecurity \
+    && cd /tmp/ModSecurity \
+    && ./build.sh \
+    && ./configure --with-pcre2 \
+      --prefix=/usr/local/modsecurity \
+      --libdir=/usr/local/modsecurity/lib \
+      --includedir=/usr/local/modsecurity/include \
+    && make -j"$(nproc)" \
+    && make install \
+    && test -f /usr/local/modsecurity/include/modsecurity/modsecurity.h \
+    && ls -1 /usr/local/modsecurity/lib/libmodsecurity.so* >/dev/null \
+    && (cd /usr/local/modsecurity/lib \
+        && real="$(find . -maxdepth 1 -type f -name 'libmodsecurity.so.*' -print | sed 's|^\\./||' | head -n1)" \
+        && test -n "$real" \
+        && ln -sf "$real" libmodsecurity.so.3 \
+        && ln -sf "$real" libmodsecurity.so)
+
+
+FROM module-builder AS build-modsecurity-nginx
+
+ARG NGINX_VERSION
+
+COPY --from=build-modsecurity /usr/local/modsecurity/ /usr/local/modsecurity/
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libcurl4 \
+        libgeoip1 \
+        liblmdb0 \
+        libpcre2-8-0 \
+        libxml2 \
+        libyajl2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ldconfig
+
+RUN git clone --depth 1 https://github.com/owasp-modsecurity/ModSecurity-nginx /tmp/ModSecurity-nginx \
+    && cd "/tmp/nginx-${NGINX_VERSION}" \
+    && ./configure --with-compat --add-dynamic-module=/tmp/ModSecurity-nginx \
+      --with-cc-opt="-I/usr/local/modsecurity/include" \
+      --with-ld-opt="-L/usr/local/modsecurity/lib" \
+    && make modules \
+    && install -D -m 0644 objs/ngx_http_modsecurity_module.so /out/ngx_http_modsecurity_module.so
+
+
+FROM module-builder AS build-modsecurity-crs
+
+RUN git clone --depth 1 https://github.com/coreruleset/coreruleset /tmp/coreruleset \
+    && mkdir -p /out \
+    && cp -R /tmp/coreruleset/rules /out/owasp-crs-rules \
+    && cp /tmp/coreruleset/crs-setup.conf.example /out/owasp-crs-setup.conf
+
+
+FROM module-builder AS package-modsecurity
+
+COPY --from=build-modsecurity /usr/local/modsecurity/lib/ /tmp/modsecurity-lib/
+
+RUN mkdir -p /out/modsecurity \
+    && cp /tmp/ModSecurity/modsecurity.conf-recommended /out/modsecurity/modsecurity.conf-recommended \
+    && cp /tmp/ModSecurity/unicode.mapping /out/modsecurity/unicode.mapping \
+    && cp -R /tmp/ModSecurity /tmp/ModSecurity-src
+
+COPY --from=build-modsecurity /tmp/ModSecurity/modsecurity.conf-recommended /out/modsecurity/modsecurity.conf-recommended
+COPY --from=build-modsecurity /tmp/ModSecurity/unicode.mapping /out/modsecurity/unicode.mapping
+COPY --from=build-modsecurity-crs /out /out/modsecurity/crs
+
+RUN mkdir -p /out/lib \
+    && cp -L /tmp/modsecurity-lib/libmodsecurity.so* /out/lib/
+
+
+FROM module-builder AS build-headers-more
+
+RUN git clone --depth 1 https://github.com/openresty/headers-more-nginx-module /tmp/headers-more
+
+RUN cd "/tmp/nginx-${NGINX_VERSION}" \
+    && ./configure --with-compat --add-dynamic-module=/tmp/headers-more \
+    && make modules \
+    && install -D -m 0644 objs/ngx_http_headers_more_filter_module.so /out/ngx_http_headers_more_filter_module.so
+
+
+FROM scratch AS out-headers-more
+
+COPY --from=build-headers-more /out/ngx_http_headers_more_filter_module.so /out/ngx_http_headers_more_filter_module.so
+
+
+FROM scratch AS out-modsecurity
+
+COPY --from=build-modsecurity-nginx /out/ngx_http_modsecurity_module.so /out/modules/ngx_http_modsecurity_module.so
+COPY --from=package-modsecurity /out/lib/ /out/lib/
+COPY --from=package-modsecurity /out/modsecurity/ /out/modsecurity/
+
